@@ -9,11 +9,12 @@ DreamZero is a World Action Model that jointly predicts actions and videos, achi
 - Pretrained DreamZero-DROID model checkpoint
 - Distributed WebSocket inference server (GB200, H100)
 - DiT caching for optimized inference (~0.6s on GB200, ~3s on H100)
-- [PolaRiS](https://polaris-evals.github.io/) simulation environment support (DROID simulation)
+- DROID simulation evaluation support
 - [RoboArena](https://robo-arena.github.io/) integration (DROID real)
 - Video generation and saving (MP4)
 
 **Coming Soon**
+- [PolaRiS](https://polaris-evals.github.io/) simulation environment support
 - [Genie 3.0](https://arxiv.org/abs/2601.02078) sim environment support
 
 ## Testing Out DreamZero in Simulation with API
