@@ -40,7 +40,7 @@ uvx hf download owhan/DROID-sim-environments --repo-type dataset --local-dir ass
 
 # Run eval script
 cd ..
-python droid_sim_evals/run_eval.py --host <API_HOST> --port <API_PORT> 
+python eval_utils/run_sim_eval.py --host <API_HOST> --port <API_PORT> 
 ```
 
 The outputs are saved in `runs` directory.

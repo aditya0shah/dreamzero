@@ -1,3 +1,10 @@
+"""Server for serving a policy over websockets.
+
+Adapted from https://github.com/robo-arena/roboarena/
+
+"""
+
+
 import asyncio
 import dataclasses
 import logging

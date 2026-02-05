@@ -25,6 +25,10 @@ from tianshou.data import Batch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
+# Use roboarena policy server interface
+from eval_utils.policy_server import WebsocketPolicyServer as RoboarenaServer
+from eval_utils.policy_server import PolicyServerConfig
+
 logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
@@ -35,7 +39,6 @@ class Args:
     enable_dit_cache: bool = False
     index: int = 0
     max_chunk_size: int | None = None  # If None, use config value. Otherwise override max_chunk_size for inference.
-    roboarena_server: bool = False  # If True, use roboarena policy server interface
 
 
 class ARDroidRoboarenaPolicy:
@@ -774,53 +777,37 @@ def main(args: Args) -> None:
     else:
         output_dir = None
         logging.info(f"Rank {rank} starting as worker for distributed inference...")
-
-    if args.roboarena_server:
-        # Use roboarena policy server interface
-        from droid_sim_evals.policy_server import WebsocketPolicyServer as RoboarenaServer
-        from droid_sim_evals.policy_server import PolicyServerConfig
-        
-        # Create wrapper policy that converts between roboarena and AR_droid formats
-        wrapper_policy = ARDroidRoboarenaPolicy(
-            groot_policy=policy,
-            signal_group=signal_group,
-            output_dir=output_dir,
+    
+    # Create wrapper policy that converts between roboarena and AR_droid formats
+    wrapper_policy = ARDroidRoboarenaPolicy(
+        groot_policy=policy,
+        signal_group=signal_group,
+        output_dir=output_dir,
+    )
+    
+    # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)
+    server_config = PolicyServerConfig(
+        image_resolution=(180, 320),  # AR_droid expects 180x320 images
+        needs_wrist_camera=True,
+        n_external_cameras=2,
+        needs_stereo_camera=False,
+        needs_session_id=True,  # Track session to reset state for new clients
+        action_space="joint_position",
+    )
+    
+    if rank == 0:
+        logging.info("Using roboarena policy server interface")
+        logging.info(f"Server config: {server_config}")
+        roboarena_server = RoboarenaServer(
+            policy=wrapper_policy,
+            server_config=server_config,
+            host="0.0.0.0",
+            port=args.port,
         )
-        
-        # Configure server for AR_droid (2 external cameras, wrist camera, joint position actions)
-        server_config = PolicyServerConfig(
-            image_resolution=(180, 320),  # AR_droid expects 180x320 images
-            needs_wrist_camera=True,
-            n_external_cameras=2,
-            needs_stereo_camera=False,
-            needs_session_id=True,  # Track session to reset state for new clients
-            action_space="joint_position",
-        )
-        
-        if rank == 0:
-            logging.info("Using roboarena policy server interface")
-            logging.info(f"Server config: {server_config}")
-            roboarena_server = RoboarenaServer(
-                policy=wrapper_policy,
-                server_config=server_config,
-                host="0.0.0.0",
-                port=args.port,
-            )
-            roboarena_server.serve_forever()
-        else:
-            # Non-rank-0 processes need to run worker loop for distributed inference
-            # We'll use the existing WebsocketPolicyServer's worker loop mechanism
-            server = WebsocketPolicyServer(
-                policy=policy,
-                host="0.0.0.0",
-                port=args.port,
-                metadata=policy_metadata,
-                output_dir=output_dir,
-                signal_group=signal_group,
-            )
-            asyncio.run(server._worker_loop())
+        roboarena_server.serve_forever()
     else:
-        # Use original websocket server
+        # Non-rank-0 processes need to run worker loop for distributed inference
+        # We'll use the existing WebsocketPolicyServer's worker loop mechanism
         server = WebsocketPolicyServer(
             policy=policy,
             host="0.0.0.0",
@@ -829,7 +816,8 @@ def main(args: Args) -> None:
             output_dir=output_dir,
             signal_group=signal_group,
         )
-        server.serve_forever(rank=rank)
+        asyncio.run(server._worker_loop())
+    
 
 
 if __name__ == "__main__":
