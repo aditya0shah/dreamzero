@@ -115,10 +115,15 @@ class ARDroidRoboarenaPolicy:
         # Accumulate frames for each camera view
         for roboarena_key, droid_key in image_key_mapping.items():
             if roboarena_key in obs:
-                frame = obs[roboarena_key]  # (H, W, 3)
-                if isinstance(frame, np.ndarray):
-                    self._frame_buffers[droid_key].append(frame)
-        
+                data = obs[roboarena_key]
+                if isinstance(data, np.ndarray):
+                    if data.ndim == 4:
+                        # Multiple frames (T, H, W, 3)
+                        self._frame_buffers[droid_key].extend(list(data))
+                    else:
+                        # Single frame (H, W, 3)
+                        self._frame_buffers[droid_key].append(data)
+
         # Determine how many frames to use
         if self._is_first_call:
             # First call: use only 1 frame
@@ -326,6 +331,7 @@ class ARDroidRoboarenaPolicy:
                     sample_frame = frame_list[0]
                     if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
                         save_dir = self._output_dir
+                        os.makedirs(save_dir, exist_ok=True)
                         all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
                         timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
                         num_frames = len(frame_list)
@@ -602,6 +608,7 @@ class WebsocketPolicyServer:
                         if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
                             # Save all frames as a single MP4 file
                             save_dir = self._output_dir if self._output_dir else "."
+                            os.makedirs(save_dir, exist_ok=True)
                             all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
                             timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
                             num_frames = len(frame_list)
@@ -633,6 +640,7 @@ class WebsocketPolicyServer:
                         if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
                             # Save all frames as a single MP4 file
                             save_dir = self._output_dir if self._output_dir else "."
+                            os.makedirs(save_dir, exist_ok=True)
                             all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
                             timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
                             num_frames = len(frame_list)
@@ -675,6 +683,7 @@ class WebsocketPolicyServer:
                         if len(sample_frame.shape) == 3 and sample_frame.shape[2] in [1, 3, 4]:
                             # Save all frames as a single MP4 file
                             save_dir = self._output_dir if self._output_dir else "."
+                            os.makedirs(save_dir, exist_ok=True)
                             all_mp4_files = [f for f in os.listdir(save_dir) if f.endswith(".mp4")]
                             timestamp = datetime.datetime.now().strftime("%m_%d_%H_%M_%S")
                             num_frames = len(frame_list)
@@ -773,6 +782,7 @@ def main(args: Args) -> None:
         date_suffix = datetime.datetime.now().strftime("%Y%m%d")
         checkpoint_name = os.path.basename(model_path)
         output_dir = os.path.join(parent_dir, f"real_world_eval_gen_{date_suffix}_{args.index}", checkpoint_name)
+        os.makedirs(output_dir, exist_ok=True)
         logging.info("Videos will be saved to: %s", output_dir)
     else:
         output_dir = None
