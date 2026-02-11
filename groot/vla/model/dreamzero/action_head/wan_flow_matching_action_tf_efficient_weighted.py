@@ -14,6 +14,25 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from safetensors.torch import load_file
 import json
+from huggingface_hub import hf_hub_download
+
+
+WAN_HF_REPO_ID = "Wan-AI/Wan2.1-I2V-14B-480P"
+
+
+def hf_download(filename: str) -> str:
+    """Download a file from the Wan2.1-I2V-14B-480P HuggingFace repo to HF cache."""
+    print(f"Downloading {filename} from HuggingFace ({WAN_HF_REPO_ID})...")
+    path = hf_hub_download(repo_id=WAN_HF_REPO_ID, filename=filename)
+    print(f"Downloaded to {path}")
+    return path
+
+
+def ensure_file(path: str | None, hf_filename: str) -> str:
+    """Return a valid local path: use `path` if it exists, otherwise download from HuggingFace."""
+    if path is not None and os.path.exists(path):
+        return path
+    return hf_download(hf_filename)
 
 from torch.distributions import Beta
 import torch.distributed as dist
@@ -217,24 +236,44 @@ class WANPolicyHead(ActionHead):
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
         
-        if self.text_encoder.text_encoder_pretrained_path is not None:
-            print("Loading text encoder from ", self.text_encoder.text_encoder_pretrained_path)
-            self.text_encoder.load_state_dict(torch.load(self.text_encoder.text_encoder_pretrained_path, map_location='cpu'))
+        text_enc_path = ensure_file(
+            self.text_encoder.text_encoder_pretrained_path,
+            "models_t5_umt5-xxl-enc-bf16.pth",
+        )
+        print("Loading text encoder from ", text_enc_path)
+        self.text_encoder.load_state_dict(torch.load(text_enc_path, map_location='cpu'))
 
-        if self.image_encoder.image_encoder_pretrained_path is not None:
-            print("Loading image encoder from ", self.image_encoder.image_encoder_pretrained_path)
-            self.image_encoder.model.load_state_dict(torch.load(self.image_encoder.image_encoder_pretrained_path, map_location='cpu'), strict=False)
-            print("Image encoder loaded")
+        img_enc_path = ensure_file(
+            self.image_encoder.image_encoder_pretrained_path,
+            "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+        )
+        print("Loading image encoder from ", img_enc_path)
+        self.image_encoder.model.load_state_dict(torch.load(img_enc_path, map_location='cpu'), strict=False)
+        print("Image encoder loaded")
 
-        if self.vae.vae_pretrained_path is not None:
-            print("Loading vae from ", self.vae.vae_pretrained_path)
-            self.vae.model.load_state_dict(torch.load(self.vae.vae_pretrained_path, map_location='cpu'))
+        vae_path = ensure_file(
+            self.vae.vae_pretrained_path,
+            "Wan2.1_VAE.pth",
+        )
+        print("Loading vae from ", vae_path)
+        self.vae.model.load_state_dict(torch.load(vae_path, map_location='cpu'))
 
-        if not config.skip_component_loading:   
-            if self.model.diffusion_model_pretrained_path is not None:
-                print("Loading model from ", self.model.diffusion_model_pretrained_path)
-                safetensors_path = os.path.join(self.model.diffusion_model_pretrained_path, "diffusion_pytorch_model.safetensors")
-                safetensors_index_path = os.path.join(self.model.diffusion_model_pretrained_path, "diffusion_pytorch_model.safetensors.index.json")
+        if not config.skip_component_loading:
+            dit_dir = self.model.diffusion_model_pretrained_path
+            # Auto-download diffusion model safetensors from HuggingFace if not available locally
+            if dit_dir is None or not os.path.isdir(dit_dir):
+                print(f"Diffusion model dir not found locally, downloading from HuggingFace ({WAN_HF_REPO_ID})...")
+                index_path = hf_hub_download(repo_id=WAN_HF_REPO_ID, filename="diffusion_pytorch_model.safetensors.index.json")
+                dit_dir = os.path.dirname(index_path)
+                with open(index_path, 'r') as f:
+                    index = json.load(f)
+                for shard_file in set(index["weight_map"].values()):
+                    hf_hub_download(repo_id=WAN_HF_REPO_ID, filename=shard_file)
+
+            if dit_dir is not None:
+                print("Loading model from ", dit_dir)
+                safetensors_path = os.path.join(dit_dir, "diffusion_pytorch_model.safetensors")
+                safetensors_index_path = os.path.join(dit_dir, "diffusion_pytorch_model.safetensors.index.json")
                 state_dict = {}
 
                 if os.path.exists(safetensors_index_path):
@@ -246,7 +285,7 @@ class WANPolicyHead(ActionHead):
 
                     # Load each shard
                     for shard_file in set(index["weight_map"].values()):
-                        shard_path = os.path.join(self.model.diffusion_model_pretrained_path, shard_file)
+                        shard_path = os.path.join(dit_dir, shard_file)
                         print(f"Loading shard: {shard_path}")
                         shard_state_dict = load_file(shard_path)
                         state_dict.update(shard_state_dict)

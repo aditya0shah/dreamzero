@@ -10,8 +10,8 @@ import dataclasses
 import logging
 import traceback
 
-from openpi_client.base_policy import BasePolicy
-from openpi_client import msgpack_numpy
+from client_lib.base_policy import BasePolicy
+from client_lib import msgpack_numpy
 import websockets.asyncio.server
 import websockets.frames
 
