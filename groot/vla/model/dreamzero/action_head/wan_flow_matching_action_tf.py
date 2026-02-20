@@ -158,7 +158,7 @@ class WANPolicyHead(ActionHead):
         config: WANPolicyHeadConfig,
     ):
         super().__init__()
-        self.tiled = config.tiled 
+        self.tiled = config.tiled
         self.tile_size_height = config.tile_size_height
         self.tile_size_width = config.tile_size_width
         self.tile_stride_height = config.tile_stride_height
@@ -399,7 +399,7 @@ class WANPolicyHead(ActionHead):
             self.print_trainable_params()
         else:
             print("LoRA injection not needed (train_architecture != 'lora')")
-    
+
     def set_frozen_modules_to_eval_mode(self):
         """
         Huggingface will call model.train() at each training_step. To ensure
@@ -530,8 +530,17 @@ class WANPolicyHead(ActionHead):
             prompt_emb[:, v:] = 0
         return prompt_emb
 
+    def _ensure_vae_on_device(self, ref_tensor):
+        """Lazily move the VAE to the correct device/dtype on first use."""
+        if not getattr(self, '_vae_device_ready', False):
+            self.vae.to(device=ref_tensor.device, dtype=torch.bfloat16)
+            self.vae.eval()
+            self._vae_device_ready = True
+
     def encode_video(self, input_video, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
-        latents = self.vae.encode(input_video, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        self._ensure_vae_on_device(input_video)
+        with torch.no_grad():
+            latents = self.vae.encode(input_video, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return latents
 
     def encode_image(self, image, num_frames, height, width):
@@ -546,7 +555,9 @@ class WANPolicyHead(ActionHead):
             # mask shape is B * 4 * (1+(T-1)/4) * h/8 * w/8
             image_input = image.transpose(1, 2)
             image_zeros = torch.zeros(batch_size, 3, num_frames-1, height, width, dtype=torch.bfloat16, device=self._device)
-            y = self.vae.encode(torch.concat([image_input, image_zeros], dim=2))
+            self._ensure_vae_on_device(image_input)
+            with torch.no_grad():
+                y = self.vae.encode(torch.concat([image_input, image_zeros], dim=2))
             new_image = y[:, :, 0:1]
             # y shape is B * 16 * (1+(T-1)/4) * h/8 * w/8
             y = torch.concat([msk, y], dim=1)

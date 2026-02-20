@@ -1,5 +1,5 @@
 #!/bin/bash
-# DreamZero DROID Full Fine-Tuning Script (8x H100, ZeRO Stage 3)
+# DreamZero DROID Full Fine-Tuning Script (8x H100, ZeRO-2 + CPU Offload)
 #
 # Usage:
 #   bash scripts/train/droid_training_full_finetune.sh
@@ -22,7 +22,7 @@ DROID_DATA_ROOT=${DROID_DATA_ROOT:-"/mnt/amlfs-02/shared/datasets/droid_101_succ
 # Output directory for training checkpoints
 OUTPUT_DIR=${OUTPUT_DIR:-"./checkpoints/dreamzero_droid_full_finetune"}
 
-# Number of GPUs to use (8x H100 for ZeRO3 full fine-tuning)
+# Number of GPUs to use (8x H100 for ZeRO-2 + CPU offload full fine-tuning)
 NUM_GPUS=${NUM_GPUS:-8}
 
 # Model weight paths (download from HuggingFace if not already present)
@@ -65,7 +65,7 @@ torchrun --nproc_per_node $NUM_GPUS --standalone groot/vla/experiment/experiment
     num_state_per_block=1 \
     seed=42 \
     training_args.learning_rate=1e-5 \
-    training_args.deepspeed="groot/vla/configs/deepspeed/zero3.json" \
+    training_args.deepspeed="groot/vla/configs/deepspeed/zero2_offload.json" \
     save_steps=1000 \
     training_args.warmup_ratio=0.05 \
     output_dir=$OUTPUT_DIR \
