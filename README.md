@@ -121,6 +121,18 @@ The server saves:
 - **Videos**: Generated video predictions as MP4 files in `{model_path}/real_world_eval_gen_{date}_{index}/{checkpoint_name}/`
 - **Input observations**: Saved per message in `{output_dir}/inputs/{msg_index}_{timestamp}/`
 
+## Real DROID MPC (DreamZero + Reward FM)
+
+For the full 3-machine real-robot MPC pipeline (Robot laptop + H100 + Reward server), see:
+
+- `docs/REAL_DROID_MPC_PIPELINE.md`
+
+This includes:
+
+- launch commands for all 3 machines
+- a minimal orchestrator client (`robots/droid_dreamzero_orchestrator.py`)
+- direct-IP and Pinggy networking options
+
 
 ## Training
 

@@ -48,9 +48,10 @@ import time
 import threading
 import uuid
 import importlib.util
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
+import requests
 
 # ---------------------------------------------------------------------------
 # Import shared utilities from remote_server_utils.py (same dir as this file,
@@ -98,6 +99,63 @@ try:
 except ImportError as e:
     print(f"Warning: DROID not found: {e}")
     DROID_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Reward FM client for MPC scoring
+# ---------------------------------------------------------------------------
+
+class RewardClient:
+    """Client for the Reward FM evaluation server (eval_server.py).
+
+    Sends imagined video frames to the reward model and returns a progress
+    score in [0, 1].
+    """
+
+    def __init__(self, host: str, port: int):
+        self.url = f"http://{host}:{port}/evaluate_batch"
+
+    def score_trajectories(
+        self,
+        candidates: List[Dict[str, Any]],
+        task: str,
+    ) -> List[float]:
+        """Score multiple candidate trajectories in a single batch request.
+
+        Args:
+            candidates: List of dicts with "video_frames" key (T, H, W, 3) uint8.
+            task: Language task instruction.
+
+        Returns:
+            List of progress scores (one per candidate), each in [0, 1].
+        """
+        samples = []
+        for i, c in enumerate(candidates):
+            frames = c["video_frames"]  # (T, H, W, 3) uint8
+            samples.append({
+                "sample_type": "progress",
+                "trajectory": {
+                    "frames": frames.tolist(),
+                    "task": task,
+                    "frames_shape": list(frames.shape),
+                    "id": f"plan_candidate_{i}",
+                },
+            })
+
+        payload = {"samples": samples}
+        resp = requests.post(self.url, json=payload, timeout=60)
+        resp.raise_for_status()
+        result = resp.json()
+
+        progress_preds = result["outputs_progress"]["progress_pred"]
+        scores = []
+        for pred in progress_preds:
+            # pred is a list of per-frame progress values; take the last one
+            if isinstance(pred, list) and len(pred) > 0:
+                scores.append(float(pred[-1]))
+            else:
+                scores.append(0.0)
+        return scores
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -350,7 +408,8 @@ def execute_chunk(
 # Client handler
 # ---------------------------------------------------------------------------
 
-def handle_client(conn, addr, env, camera_config, dz_client, args, episode_state):
+def handle_client(conn, addr, env, camera_config, dz_client, args, episode_state,
+                  reward_client=None):
     """Handle one orchestrator connection with the RUN_CHUNK loop."""
     print(f"Connected: {addr}")
 
@@ -448,14 +507,59 @@ def handle_client(conn, addr, env, camera_config, dz_client, args, episode_state
                                     prompt=prompt, session_id=session_id,
                                     robot_state=robot_state)
 
-                print(f"\n[RUN_CHUNK {chunk_idx}] Calling DreamZero...")
+                mpc_enabled = args.mpc and reward_client is not None
+
+                print(f"\n[RUN_CHUNK {chunk_idx}] {'MPC' if mpc_enabled else 'Standard'} mode...")
                 infer_start = time.time()
-                try:
-                    actions_dict = dz_client.infer(obs)
-                except Exception as e:
-                    send_msg(conn, {"type": "ERROR", "message": f"DreamZero infer failed: {e}"})
-                    continue
-                print(f"  DreamZero latency: {time.time() - infer_start:.2f}s")
+
+                if mpc_enabled:
+                    # --- MPC Planning ---
+                    n_candidates = args.mpc_n_candidates
+                    seeds = list(range(n_candidates))
+                    print(f"  Planning with N={n_candidates} candidates...")
+
+                    try:
+                        candidates = dz_client.plan(obs, seeds)
+                    except Exception as e:
+                        send_msg(conn, {"type": "ERROR",
+                                        "message": f"DreamZero plan failed: {e}"})
+                        continue
+                    print(f"  DreamZero plan latency: {time.time() - infer_start:.2f}s")
+
+                    # Score each candidate with the reward model
+                    score_start = time.time()
+                    try:
+                        scores = reward_client.score_trajectories(candidates, prompt)
+                    except Exception as e:
+                        print(f"  WARNING: Reward scoring failed: {e}")
+                        print(f"  Falling back to candidate 0")
+                        scores = [0.0] * n_candidates
+                        scores[0] = 1.0
+                    print(f"  Reward scoring latency: {time.time() - score_start:.2f}s")
+                    print(f"  Scores: {[f'{s:.3f}' for s in scores]}")
+
+                    best_idx = int(np.argmax(scores))
+                    print(f"  Best candidate: {best_idx} (score={scores[best_idx]:.3f})")
+
+                    actions_dict = {
+                        "action.joint_position": candidates[best_idx]["action.joint_position"],
+                        "action.gripper_position": candidates[best_idx]["action.gripper_position"],
+                    }
+
+                    # Commit the chosen candidate's KV state on DreamZero server
+                    try:
+                        dz_client.commit(best_idx)
+                    except Exception as e:
+                        print(f"  WARNING: commit() failed: {e}")
+                else:
+                    # --- Standard single inference ---
+                    try:
+                        actions_dict = dz_client.infer(obs)
+                    except Exception as e:
+                        send_msg(conn, {"type": "ERROR",
+                                        "message": f"DreamZero infer failed: {e}"})
+                        continue
+                    print(f"  DreamZero latency: {time.time() - infer_start:.2f}s")
 
                 # Read action horizon from response
                 action_horizon = actions_dict["action.joint_position"].shape[0]
@@ -522,6 +626,16 @@ def run_server(args):
     dz_client = WebsocketClientPolicy(host=args.dreamzero_host, port=args.dreamzero_port)
     print("✓ Connected to DreamZero server")
 
+    # MPC reward client (if enabled)
+    reward_client = None
+    if args.mpc:
+        print(f"MPC mode enabled: N={args.mpc_n_candidates} candidates")
+        print(f"Connecting to reward server at {args.reward_server_host}:{args.reward_server_port}...")
+        reward_client = RewardClient(
+            host=args.reward_server_host, port=args.reward_server_port
+        )
+        print("✓ Reward client configured")
+
     episode_state = EpisodeState(max_steps=args.max_steps)
     keyboard_thread = threading.Thread(
         target=keyboard_listener, args=(episode_state,), daemon=True
@@ -541,7 +655,8 @@ def run_server(args):
         while True:
             try:
                 conn, addr = server_sock.accept()
-                handle_client(conn, addr, env, camera_config, dz_client, args, episode_state)
+                handle_client(conn, addr, env, camera_config, dz_client, args,
+                              episode_state, reward_client=reward_client)
             except _socket.timeout:
                 continue
     except KeyboardInterrupt:
@@ -578,6 +693,16 @@ def main():
     parser.add_argument("--max-steps", type=int, default=600,
                         help="Max steps per episode before timeout (default: 600)")
 
+    # MPC planning mode
+    parser.add_argument("--mpc", action="store_true",
+                        help="Enable MPC planning mode (requires reward server)")
+    parser.add_argument("--mpc-n-candidates", type=int, default=8,
+                        help="Number of candidate trajectories for MPC (default: 8)")
+    parser.add_argument("--reward-server-host", type=str, default="localhost",
+                        help="Hostname/IP of the Reward FM server")
+    parser.add_argument("--reward-server-port", type=int, default=8001,
+                        help="Port of the Reward FM server (default: 8001)")
+
     args = parser.parse_args()
 
     print("=" * 60)
@@ -590,6 +715,11 @@ def main():
     print(f"TCP server port:   {args.server_port}")
     print(f"Image resolution:  {IMAGE_W}x{IMAGE_H} (DreamZero-DROID)")
     print(f"Max steps:         {args.max_steps}")
+    if args.mpc:
+        print(f"MPC mode:          ON (N={args.mpc_n_candidates})")
+        print(f"Reward server:     {args.reward_server_host}:{args.reward_server_port}")
+    else:
+        print(f"MPC mode:          OFF")
     print("=" * 60)
 
     run_server(args)

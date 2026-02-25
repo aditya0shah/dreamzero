@@ -4,9 +4,13 @@ Adapted from https://github.com/robo-arena/roboarena/
 
 """
 
+import io
 import logging
 import time
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
+
+import numpy as np
+from PIL import Image as PILImage
 
 import websockets.sync.client
 from typing_extensions import override
@@ -84,6 +88,70 @@ class WebsocketClientPolicy(BasePolicy):
         self._ws.send(data)
         response = self._ws.recv()
         return response
+
+    def plan(self, obs: Dict, seeds: List[int]) -> List[Dict]:
+        """Generate N candidate trajectories with different seeds (MPC planning).
+
+        Args:
+            obs: Observation dict (same format as infer()).
+            seeds: List of N integer seeds for diverse generation.
+
+        Returns:
+            List of N dicts, each containing:
+              - "action.joint_position": np.ndarray (T, 7)
+              - "action.gripper_position": np.ndarray (T, 1)
+              - "video_frames": np.ndarray (T, H, W, 3) uint8 RGB
+        """
+        obs["endpoint"] = "plan"
+        obs["_plan_seeds"] = seeds
+
+        data = self._packer.pack(obs)
+        self._ws.send(data)
+        response = self._ws.recv()
+        if isinstance(response, str):
+            raise RuntimeError(f"Error in plan():\n{response}")
+
+        result = msgpack_numpy.unpackb(response)
+        candidates = result["candidates"]
+
+        # Decode JPEG frames back to numpy arrays
+        decoded_candidates = []
+        for c in candidates:
+            jpeg_frames = c["video_frames_jpeg"]
+            shape = tuple(c["video_frames_shape"])
+            frames = np.stack([
+                np.array(PILImage.open(io.BytesIO(jpg_bytes)))
+                for jpg_bytes in jpeg_frames
+            ])
+            decoded_candidates.append({
+                "action.joint_position": c["action.joint_position"],
+                "action.gripper_position": c["action.gripper_position"],
+                "video_frames": frames,
+            })
+
+        return decoded_candidates
+
+    def commit(self, best_idx: int) -> None:
+        """Tell the server to adopt the KV cache state from candidate best_idx.
+
+        Must be called after plan(). After commit, subsequent infer() calls
+        build on the chosen trajectory's context.
+
+        Args:
+            best_idx: Index of the chosen candidate (0-based).
+        """
+        msg = {
+            "endpoint": "commit",
+            "_commit_idx": best_idx,
+        }
+        data = self._packer.pack(msg)
+        self._ws.send(data)
+        response = self._ws.recv()
+        if isinstance(response, bytes):
+            # Unexpected bytes response
+            raise RuntimeError(f"Unexpected response from commit(): {response}")
+        # Expected: "commit successful" string
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

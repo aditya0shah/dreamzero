@@ -97,6 +97,14 @@ class WebsocketPolicyServer:
                 if endpoint == "reset":
                     self._policy.reset(obs)
                     to_return = "reset successful"
+                elif endpoint == "plan":
+                    seeds = obs.pop("_plan_seeds")
+                    result = self._policy.plan(obs, seeds)
+                    to_return = packer.pack(result)
+                elif endpoint == "commit":
+                    best_idx = obs.pop("_commit_idx")
+                    self._policy.commit(best_idx)
+                    to_return = "commit successful"
                 else:
                     action = self._policy.infer(obs)
                     to_return = packer.pack(action)

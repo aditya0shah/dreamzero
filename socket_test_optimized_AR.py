@@ -1,4 +1,6 @@
+import copy
 import dataclasses
+import io
 import logging
 import socket
 import asyncio
@@ -352,10 +354,197 @@ class ARDroidRoboarenaPolicy:
     
     def reset(self, reset_info: dict) -> None:
         """Reset the policy state for a new episode.
-        
+
         Clears frame buffers and resets call count.
         """
         self._reset_state(save_video=True)
+
+    # ------------------------------------------------------------------
+    # MPC Planning: PLAN / COMMIT
+    # ------------------------------------------------------------------
+
+    def _snapshot_kv_state(self) -> dict:
+        """Snapshot all KV cache state from the action head for later restore."""
+        ah = self._policy.trained_model.action_head
+        return {
+            "kv_cache1": copy.deepcopy(ah.kv_cache1),
+            "kv_cache_neg": copy.deepcopy(ah.kv_cache_neg),
+            "crossattn_cache": copy.deepcopy(ah.crossattn_cache),
+            "crossattn_cache_neg": copy.deepcopy(ah.crossattn_cache_neg),
+            "current_start_frame": ah.current_start_frame,
+            "seed": ah.seed,
+        }
+
+    def _restore_kv_state(self, snapshot: dict) -> None:
+        """Restore KV cache state from a snapshot."""
+        ah = self._policy.trained_model.action_head
+        ah.kv_cache1 = snapshot["kv_cache1"]
+        ah.kv_cache_neg = snapshot["kv_cache_neg"]
+        ah.crossattn_cache = snapshot["crossattn_cache"]
+        ah.crossattn_cache_neg = snapshot["crossattn_cache_neg"]
+        ah.current_start_frame = snapshot["current_start_frame"]
+        ah.seed = snapshot["seed"]
+
+    def _vae_decode_latents(self, video_latents: torch.Tensor) -> np.ndarray:
+        """Decode video latents to pixel frames (T, H, W, 3) uint8."""
+        ah = self._policy.trained_model.action_head
+        frames = ah.vae.decode(
+            video_latents,
+            tiled=ah.tiled,
+            tile_size=(ah.tile_size_height, ah.tile_size_width),
+            tile_stride=(ah.tile_stride_height, ah.tile_stride_width),
+        )
+        # frames: (B, C, T, H, W) → (B, T, H, W, C)
+        frames = rearrange(frames, "B C T H W -> B T H W C")
+        frames = frames[0]  # single batch
+        frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+        return frames  # (T, H, W, 3)
+
+    @staticmethod
+    def _jpeg_encode_frames(frames: np.ndarray, quality: int = 85) -> list[bytes]:
+        """JPEG-encode each frame for network transfer. Returns list of JPEG bytes."""
+        from PIL import Image as PILImage
+        encoded = []
+        for frame in frames:
+            img = PILImage.fromarray(frame)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality)
+            encoded.append(buf.getvalue())
+        return encoded
+
+    def plan(self, obs: dict, seeds: list[int]) -> dict:
+        """Generate N candidate trajectories with different seeds (MPC planning).
+
+        Does NOT commit any state — the action head is restored to its pre-plan
+        state after all candidates are generated.
+
+        Args:
+            obs: Observation dict (same format as infer()).
+            seeds: List of N integer seeds for diverse trajectory generation.
+
+        Returns:
+            dict with keys:
+              "candidates": list of N dicts, each with:
+                - "action.joint_position": np.ndarray (T, 7)
+                - "action.gripper_position": np.ndarray (T, 1)
+                - "video_frames_jpeg": list of JPEG-encoded bytes per frame
+                - "video_frames_shape": (T, H, W, 3)
+        """
+        ah = self._policy.trained_model.action_head
+
+        # Check for session change (same logic as infer)
+        session_id = obs.get("session_id", None)
+        if session_id is not None and session_id != self._current_session_id:
+            if self._current_session_id is not None:
+                logger.info(f"Session changed in plan(), resetting state")
+                self._reset_state()
+            self._current_session_id = session_id
+
+        # Convert observation (updates frame buffers, same as infer)
+        # We need to do this ONCE, then reuse for all candidates
+        self._call_count += 1
+        converted_obs = self._convert_observation(obs)
+
+        # Snapshot state BEFORE any forward pass
+        pre_plan_snapshot = self._snapshot_kv_state()
+
+        # Also snapshot frame buffer state and call flags so we can restore them
+        frame_buffer_snapshot = {k: list(v) for k, v in self._frame_buffers.items()}
+        is_first_call_snapshot = self._is_first_call
+
+        candidates = []
+
+        for i, seed in enumerate(seeds):
+            logger.info(f"[PLAN] Generating candidate {i+1}/{len(seeds)} with seed={seed}")
+
+            # Restore to pre-plan state for each candidate
+            self._restore_kv_state(copy.deepcopy(pre_plan_snapshot))
+
+            # Set seed for this candidate
+            ah.seed = seed
+
+            # Signal workers and run distributed forward pass
+            signal_tensor = torch.zeros(1, dtype=torch.int32, device='cpu')
+            dist.broadcast(signal_tensor, src=0, group=self._signal_group)
+            self._broadcast_batch_to_workers(converted_obs)
+
+            batch = Batch(obs=converted_obs)
+
+            dist.barrier()
+            with torch.no_grad():
+                result_batch, video_pred = self._policy.lazy_joint_forward_causal(batch)
+            dist.barrier()
+
+            # Extract actions
+            action_chunk = result_batch.act
+            action_dict = {}
+            for k in dir(action_chunk):
+                if k.startswith("action."):
+                    val = getattr(action_chunk, k)
+                    if isinstance(val, torch.Tensor):
+                        action_dict[k] = val.cpu().numpy()
+                    else:
+                        action_dict[k] = val
+
+            # VAE decode video latents → pixel frames
+            video_frames = self._vae_decode_latents(video_pred)
+
+            # JPEG-encode for network efficiency
+            jpeg_frames = self._jpeg_encode_frames(video_frames)
+
+            # Snapshot the post-forward KV state for this candidate
+            candidate_kv_state = self._snapshot_kv_state()
+
+            candidates.append({
+                "action.joint_position": action_dict.get("action.joint_position"),
+                "action.gripper_position": action_dict.get("action.gripper_position"),
+                "video_frames_jpeg": jpeg_frames,
+                "video_frames_shape": list(video_frames.shape),
+                "_kv_state": candidate_kv_state,
+            })
+
+        # Restore original pre-plan state (no state change from planning)
+        self._restore_kv_state(pre_plan_snapshot)
+        self._frame_buffers = frame_buffer_snapshot
+        self._is_first_call = is_first_call_snapshot
+
+        # Store candidate KV states for commit()
+        self._plan_candidate_states = [c.pop("_kv_state") for c in candidates]
+
+        return {"candidates": candidates}
+
+    def commit(self, best_idx: int) -> None:
+        """Adopt the KV cache state from the chosen planning candidate.
+
+        After commit, subsequent infer() calls will build on the chosen
+        trajectory's context, as if it had been executed normally.
+
+        Args:
+            best_idx: Index of the chosen candidate (0-based).
+        """
+        if not hasattr(self, '_plan_candidate_states') or self._plan_candidate_states is None:
+            raise RuntimeError("commit() called without a preceding plan()")
+
+        if best_idx < 0 or best_idx >= len(self._plan_candidate_states):
+            raise ValueError(
+                f"best_idx={best_idx} out of range [0, {len(self._plan_candidate_states)})"
+            )
+
+        logger.info(f"[COMMIT] Adopting candidate {best_idx} KV state")
+
+        # Restore the chosen candidate's state
+        chosen_state = self._plan_candidate_states[best_idx]
+        self._restore_kv_state(chosen_state)
+
+        # Also store the video_pred from the chosen candidate for potential saving
+        # (The plan didn't append to video_across_time to avoid corruption)
+
+        # Update first call flag (plan counts as a call)
+        if self._is_first_call:
+            self._is_first_call = False
+
+        # Free all candidate states
+        self._plan_candidate_states = None
 
 
 class WebsocketPolicyServer:
