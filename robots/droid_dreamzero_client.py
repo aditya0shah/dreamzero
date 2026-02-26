@@ -175,6 +175,38 @@ class RewardClient:
         return scores
 
 
+def save_mpc_candidate_videos(
+    candidates: List[Dict[str, Any]],
+    output_root: str,
+    session_id: str,
+    chunk_idx: int,
+    fps: int,
+) -> List[str]:
+    """Save MPC candidate imagined videos to disk as MP4 files."""
+    try:
+        import imageio
+    except ImportError as e:
+        raise RuntimeError("imageio is required to save MPC candidate videos") from e
+
+    session_dir = os.path.join(output_root, f"session_{session_id}", f"chunk_{chunk_idx:03d}")
+    os.makedirs(session_dir, exist_ok=True)
+
+    saved_paths: List[str] = []
+    for i, c in enumerate(candidates):
+        frames = c.get("video_frames")
+        if frames is None:
+            continue
+        if not isinstance(frames, np.ndarray):
+            frames = np.array(frames, dtype=np.uint8)
+        if frames.dtype != np.uint8:
+            frames = np.clip(frames, 0, 255).astype(np.uint8)
+
+        out_path = os.path.join(session_dir, f"candidate_{i:02d}.mp4")
+        imageio.mimsave(out_path, frames, fps=fps, codec="libx264")
+        saved_paths.append(out_path)
+    return saved_paths
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -544,6 +576,20 @@ def handle_client(conn, addr, env, camera_config, dz_client, args, episode_state
                         continue
                     print(f"  DreamZero plan latency: {time.time() - infer_start:.2f}s")
 
+                    if args.save_mpc_candidate_videos:
+                        try:
+                            saved_paths = save_mpc_candidate_videos(
+                                candidates=candidates,
+                                output_root=args.mpc_video_output_dir,
+                                session_id=session_id,
+                                chunk_idx=chunk_idx,
+                                fps=args.mpc_video_fps,
+                            )
+                            print(f"  Saved {len(saved_paths)} candidate videos to: "
+                                  f"{os.path.dirname(saved_paths[0]) if saved_paths else '(none)'}")
+                        except Exception as e:
+                            print(f"  WARNING: Failed to save MPC candidate videos: {e}")
+
                     # Score each candidate with the reward model
                     score_start = time.time()
                     try:
@@ -720,6 +766,13 @@ def main():
                         help="Hostname/IP of the Reward FM server")
     parser.add_argument("--reward-server-port", type=int, default=8001,
                         help="Port of the Reward FM server (default: 8001)")
+    parser.add_argument("--save-mpc-candidate-videos", action="store_true",
+                        help="Save MPC candidate imagined videos for each chunk")
+    parser.add_argument("--mpc-video-output-dir", type=str,
+                        default="debug_outputs/real_robot_mpc",
+                        help="Output directory for saved MPC candidate videos")
+    parser.add_argument("--mpc-video-fps", type=int, default=5,
+                        help="FPS for saved MPC candidate MP4 videos")
 
     args = parser.parse_args()
 
@@ -736,6 +789,10 @@ def main():
     if args.mpc:
         print(f"MPC mode:          ON (N={args.mpc_n_candidates})")
         print(f"Reward server:     {args.reward_server_host}:{args.reward_server_port}")
+        print(f"Save candidate vids: {'ON' if args.save_mpc_candidate_videos else 'OFF'}")
+        if args.save_mpc_candidate_videos:
+            print(f"Video output dir:  {args.mpc_video_output_dir}")
+            print(f"Video FPS:         {args.mpc_video_fps}")
     else:
         print(f"MPC mode:          OFF")
     print("=" * 60)
