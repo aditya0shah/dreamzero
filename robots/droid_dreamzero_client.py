@@ -42,6 +42,8 @@ Keyboard Controls (in Terminal 1):
 """
 
 import argparse
+import io
+import json
 import os
 import sys
 import time
@@ -112,7 +114,7 @@ class RewardClient:
     """
 
     def __init__(self, host: str, port: int):
-        self.url = f"http://{host}:{port}/evaluate_batch"
+        self.base_url = f"http://{host}:{port}"
 
     def score_trajectories(
         self,
@@ -128,21 +130,37 @@ class RewardClient:
         Returns:
             List of progress scores (one per candidate), each in [0, 1].
         """
-        samples = []
+        # Reward server expects ndarray frames via /evaluate_batch_npy multipart payload.
+        files = {}
+        data = {}
         for i, c in enumerate(candidates):
             frames = c["video_frames"]  # (T, H, W, 3) uint8
-            samples.append({
+            if not isinstance(frames, np.ndarray):
+                frames = np.array(frames, dtype=np.uint8)
+
+            file_key = f"sample_{i}_trajectory_frames"
+            buf = io.BytesIO()
+            np.save(buf, frames)
+            buf.seek(0)
+            files[file_key] = (f"{file_key}.npy", buf, "application/octet-stream")
+
+            sample = {
                 "sample_type": "progress",
                 "trajectory": {
-                    "frames": frames.tolist(),
+                    "frames": {"__numpy_file__": file_key},
                     "task": task,
-                    "frames_shape": list(frames.shape),
+                    "frames_shape": [int(x) for x in frames.shape],
                     "id": f"plan_candidate_{i}",
                 },
-            })
+            }
+            data[f"sample_{i}"] = json.dumps(sample)
 
-        payload = {"samples": samples}
-        resp = requests.post(self.url, json=payload, timeout=60)
+        resp = requests.post(
+            f"{self.base_url}/evaluate_batch_npy",
+            files=files,
+            data=data,
+            timeout=60,
+        )
         resp.raise_for_status()
         result = resp.json()
 
