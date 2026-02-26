@@ -14,6 +14,8 @@ Input observations come from prerecorded MP4s if available, or random images.
 from __future__ import annotations
 
 import argparse
+import io
+import json
 import os
 import uuid
 from typing import Any
@@ -97,22 +99,36 @@ def _score_with_reward_server(
     task: str,
     timeout_seconds: int,
 ) -> list[float]:
-    samples = []
+    files = {}
+    data = {}
     for i, c in enumerate(candidates):
         frames = c["video_frames"]  # (T, H, W, 3) uint8
-        samples.append(
-            {
-                "sample_type": "progress",
-                "trajectory": {
-                    "frames": frames.tolist(),
-                    "task": task,
-                    "frames_shape": list(frames.shape),
-                    "id": f"smoke_candidate_{i}",
-                },
-            }
-        )
-    payload = {"samples": samples}
-    resp = requests.post(reward_url, json=payload, timeout=timeout_seconds)
+        if not isinstance(frames, np.ndarray):
+            frames = np.array(frames, dtype=np.uint8)
+
+        file_key = f"sample_{i}_trajectory_frames"
+        buf = io.BytesIO()
+        np.save(buf, frames)
+        buf.seek(0)
+        files[file_key] = (f"{file_key}.npy", buf, "application/octet-stream")
+
+        sample = {
+            "sample_type": "progress",
+            "trajectory": {
+                "frames": {"__numpy_file__": file_key},
+                "task": task,
+                "frames_shape": [int(x) for x in frames.shape],
+                "id": f"smoke_candidate_{i}",
+            },
+        }
+        data[f"sample_{i}"] = json.dumps(sample)
+
+    resp = requests.post(
+        reward_url.rstrip("/") + "/evaluate_batch_npy",
+        files=files,
+        data=data,
+        timeout=timeout_seconds,
+    )
     resp.raise_for_status()
     out = resp.json()
     preds = out["outputs_progress"]["progress_pred"]
@@ -252,7 +268,7 @@ def main() -> None:
     best_idx = 0
     if args.reward_host:
         scheme = "https" if args.reward_https else "http"
-        reward_url = f"{scheme}://{args.reward_host}:{args.reward_port}/evaluate_batch"
+        reward_url = f"{scheme}://{args.reward_host}:{args.reward_port}"
         print(f"Scoring with reward server: {reward_url}")
         scores = _score_with_reward_server(
             reward_url=reward_url,
