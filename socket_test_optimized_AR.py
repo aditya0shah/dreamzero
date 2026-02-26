@@ -169,11 +169,14 @@ class ARDroidRoboarenaPolicy:
         else:
             converted["state.gripper_position"] = np.zeros((1, 1), dtype=np.float64)
         
-        # Convert prompt
-        if "prompt" in obs:
-            converted["annotation.language.action_text"] = obs["prompt"]
-        else:
-            converted["annotation.language.action_text"] = ""
+        # Convert prompt. OXE DROID checkpoints are configured to read
+        # annotation.language.language_instruction* keys.
+        prompt = obs.get("prompt", "")
+        converted["annotation.language.language_instruction"] = prompt
+        converted["annotation.language.language_instruction_2"] = prompt
+        converted["annotation.language.language_instruction_3"] = prompt
+        # Keep legacy key for compatibility with older configs.
+        converted["annotation.language.action_text"] = prompt
         
         return converted
     
