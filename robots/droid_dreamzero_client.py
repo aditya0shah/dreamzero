@@ -618,12 +618,36 @@ def handle_client(conn, addr, env, camera_config, dz_client, args, episode_state
                 else:
                     # --- Standard single inference ---
                     try:
-                        actions_dict = dz_client.infer(obs)
+                        raw_actions = dz_client.infer(obs)
                     except Exception as e:
                         send_msg(conn, {"type": "ERROR",
                                         "message": f"DreamZero infer failed: {e}"})
                         continue
                     print(f"  DreamZero latency: {time.time() - infer_start:.2f}s")
+
+                    # Normalize infer output to dict format expected downstream.
+                    if isinstance(raw_actions, np.ndarray):
+                        if raw_actions.ndim != 2 or raw_actions.shape[1] != 8:
+                            send_msg(conn, {
+                                "type": "ERROR",
+                                "message": (
+                                    f"Unexpected infer() array shape: {raw_actions.shape}, "
+                                    "expected (T, 8)"
+                                ),
+                            })
+                            continue
+                        actions_dict = {
+                            "action.joint_position": raw_actions[:, :7].astype(np.float32),
+                            "action.gripper_position": raw_actions[:, 7:8].astype(np.float32),
+                        }
+                    elif isinstance(raw_actions, dict):
+                        actions_dict = raw_actions
+                    else:
+                        send_msg(conn, {
+                            "type": "ERROR",
+                            "message": f"Unexpected infer() return type: {type(raw_actions)}",
+                        })
+                        continue
 
                 # Read action horizon from response
                 action_horizon = actions_dict["action.joint_position"].shape[0]

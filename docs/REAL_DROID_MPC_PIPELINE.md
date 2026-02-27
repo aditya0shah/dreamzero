@@ -23,6 +23,15 @@ CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_pe
   --model-path <DREAMZERO_CHECKPOINT_PATH>
 ```
 
+## without compile
+```bash
+TORCHDYNAMO_DISABLE=1 CUDA_VISIBLE_DEVICES=0,1,2 python -m torch.distributed.run --standalone --nproc_per_node=3 \
+  socket_test_optimized_AR.py \
+  --port 8000 \
+  --enable-dit-cache \
+  --model-path <DREAMZERO_CHECKPOINT_PATH>
+  ```
+
 Expected: server listens on `0.0.0.0:8000` and accepts websocket clients.
 
 ---
