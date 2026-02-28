@@ -120,12 +120,16 @@ class RewardClient:
         self,
         candidates: List[Dict[str, Any]],
         task: str,
+        prefix_chunks: Optional[List[np.ndarray]] = None,
     ) -> List[float]:
         """Score multiple candidate trajectories in a single batch request.
 
         Args:
             candidates: List of dicts with "video_frames" key (T, H, W, 3) uint8.
             task: Language task instruction.
+            prefix_chunks: Optional list of previously selected best chunk videos.
+                When provided, each candidate is scored on
+                [stitched_prefix + current_candidate_chunk].
 
         Returns:
             List of progress scores (one per candidate), each in [0, 1].
@@ -133,10 +137,31 @@ class RewardClient:
         # Reward server expects ndarray frames via /evaluate_batch_npy multipart payload.
         files = {}
         data = {}
+        prefix_chunks = prefix_chunks or []
         for i, c in enumerate(candidates):
             frames = c["video_frames"]  # (T, H, W, 3) uint8
             if not isinstance(frames, np.ndarray):
                 frames = np.array(frames, dtype=np.uint8)
+            if frames.dtype != np.uint8:
+                frames = np.clip(frames, 0, 255).astype(np.uint8)
+
+            if prefix_chunks:
+                stitched_parts: List[np.ndarray] = []
+                for j, prior in enumerate(prefix_chunks):
+                    if not isinstance(prior, np.ndarray):
+                        prior = np.array(prior, dtype=np.uint8)
+                    if prior.dtype != np.uint8:
+                        prior = np.clip(prior, 0, 255).astype(np.uint8)
+                    if prior.ndim != 4 or prior.shape[-1] not in (1, 3, 4):
+                        continue
+                    stitched_parts.append(prior if j == 0 else prior[1:])
+
+                # Append candidate chunk with first frame dropped to reduce overlap.
+                if frames.ndim == 4 and frames.shape[-1] in (1, 3, 4):
+                    stitched_parts.append(frames[1:] if len(stitched_parts) > 0 else frames)
+
+                if stitched_parts:
+                    frames = np.concatenate(stitched_parts, axis=0)
 
             file_key = f"sample_{i}_trajectory_frames"
             buf = io.BytesIO()
@@ -205,6 +230,45 @@ def save_mpc_candidate_videos(
         imageio.mimsave(out_path, frames, fps=fps, codec="libx264")
         saved_paths.append(out_path)
     return saved_paths
+
+
+def save_mpc_best_rollout_video(
+    selected_chunk_frames: List[np.ndarray],
+    output_root: str,
+    session_id: str,
+    fps: int,
+) -> Optional[str]:
+    """Save a stitched imagined rollout from the best candidate of each MPC chunk."""
+    if not selected_chunk_frames:
+        return None
+
+    try:
+        import imageio
+    except ImportError as e:
+        raise RuntimeError("imageio is required to save MPC best rollout video") from e
+
+    session_dir = os.path.join(output_root, f"session_{session_id}")
+    os.makedirs(session_dir, exist_ok=True)
+
+    stitched_parts: List[np.ndarray] = []
+    for i, frames in enumerate(selected_chunk_frames):
+        if not isinstance(frames, np.ndarray):
+            frames = np.array(frames, dtype=np.uint8)
+        if frames.dtype != np.uint8:
+            frames = np.clip(frames, 0, 255).astype(np.uint8)
+        if frames.ndim != 4 or frames.shape[-1] not in (1, 3, 4):
+            continue
+
+        # Keep all frames for first chunk; drop first frame for later chunks to reduce duplicates.
+        stitched_parts.append(frames if i == 0 else frames[1:])
+
+    if not stitched_parts:
+        return None
+
+    stitched = np.concatenate(stitched_parts, axis=0)
+    out_path = os.path.join(session_dir, "best_rollout.mp4")
+    imageio.mimsave(out_path, stitched, fps=fps, codec="libx264")
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -469,17 +533,36 @@ def handle_client(conn, addr, env, camera_config, dz_client, args, episode_state
     action_horizon = 24   # updated dynamically from DreamZero response
     session_id = None
     prompt = ""
+    selected_rollout_frames: List[np.ndarray] = []
+
+    def _maybe_save_selected_rollout() -> None:
+        if not (args.mpc and session_id is not None and len(selected_rollout_frames) > 0):
+            return
+        try:
+            out_path = save_mpc_best_rollout_video(
+                selected_chunk_frames=selected_rollout_frames,
+                output_root=args.mpc_video_output_dir,
+                session_id=session_id,
+                fps=args.mpc_video_fps,
+            )
+            if out_path:
+                print(f"Saved stitched best-rollout video to: {out_path}")
+        except Exception as e:
+            print(f"WARNING: Failed to save stitched best-rollout video: {e}")
 
     try:
         while True:
             cmd = recv_msg(conn)
             if cmd is None:
                 print("Orchestrator disconnected")
+                _maybe_save_selected_rollout()
                 dz_client.reset({})
                 break
 
             # ------------------------------------------------------------------
             if cmd["type"] == "RESET":
+                # Save previous episode's stitched rollout before starting a new one.
+                _maybe_save_selected_rollout()
                 print("\n" + "=" * 60)
                 print("RESET — starting new episode")
                 print("=" * 60)
@@ -492,6 +575,7 @@ def handle_client(conn, addr, env, camera_config, dz_client, args, episode_state
                 frame_buffer = {k: [] for k in CAM_OBS_KEYS}
                 chunk_idx = 0
                 session_id = str(uuid.uuid4())
+                selected_rollout_frames = []
 
                 # Tell DreamZero server to clear its state
                 dz_client.reset({})
@@ -593,7 +677,12 @@ def handle_client(conn, addr, env, camera_config, dz_client, args, episode_state
                     # Score each candidate with the reward model
                     score_start = time.time()
                     try:
-                        scores = reward_client.score_trajectories(candidates, prompt)
+                        prefix_chunks = selected_rollout_frames if args.mpc_reward_use_full_trajectory else None
+                        scores = reward_client.score_trajectories(
+                            candidates,
+                            prompt,
+                            prefix_chunks=prefix_chunks,
+                        )
                     except Exception as e:
                         print(f"  WARNING: Reward scoring failed: {e}")
                         print(f"  Falling back to candidate 0")
@@ -609,6 +698,7 @@ def handle_client(conn, addr, env, camera_config, dz_client, args, episode_state
                         "action.joint_position": candidates[best_idx]["action.joint_position"],
                         "action.gripper_position": candidates[best_idx]["action.gripper_position"],
                     }
+                    selected_rollout_frames.append(candidates[best_idx]["video_frames"])
 
                     # Commit the chosen candidate's KV state on DreamZero server
                     try:
@@ -685,6 +775,7 @@ def handle_client(conn, addr, env, camera_config, dz_client, args, episode_state
             # ------------------------------------------------------------------
             elif cmd["type"] == "CLOSE":
                 print("CLOSE received — ending connection")
+                _maybe_save_selected_rollout()
                 dz_client.reset({})   # triggers MP4 save on DreamZero server
                 break
 
@@ -797,6 +888,15 @@ def main():
                         help="Output directory for saved MPC candidate videos")
     parser.add_argument("--mpc-video-fps", type=int, default=5,
                         help="FPS for saved MPC candidate MP4 videos")
+    parser.add_argument(
+        "--mpc-reward-use-full-trajectory",
+        action="store_true",
+        help=(
+            "For reward scoring, evaluate each candidate on "
+            "[previously selected best chunks + current candidate chunk] "
+            "instead of only current chunk."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -813,6 +913,14 @@ def main():
     if args.mpc:
         print(f"MPC mode:          ON (N={args.mpc_n_candidates})")
         print(f"Reward server:     {args.reward_server_host}:{args.reward_server_port}")
+        print(
+            "Reward input:      "
+            + (
+                "full trajectory (selected history + current chunk)"
+                if args.mpc_reward_use_full_trajectory
+                else "current chunk only"
+            )
+        )
         print(f"Save candidate vids: {'ON' if args.save_mpc_candidate_videos else 'OFF'}")
         if args.save_mpc_candidate_videos:
             print(f"Video output dir:  {args.mpc_video_output_dir}")
